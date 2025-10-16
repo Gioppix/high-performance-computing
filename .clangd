@@ -1,0 +1,28 @@
+CompileFlags:
+  Add:
+    - -I/opt/homebrew/Cellar/open-mpi/5.0.8/include
+    - -DOMPI_SKIP_MPICXX=1
+    - -std=c11
+    - -Wall
+    - -Wextra
+    - -Wpedantic
+    - -Wconversion
+    - -Wsign-conversion
+    - -Wshadow
+    - -Wunused
+    - -Wformat=2
+    - -Wnull-dereference
+    - -Wdouble-promotion
+    - -Wreturn-type
+
+Diagnostics:
+  ClangTidy:
+    Add:
+      - clang-analyzer-*
+      - performance-*
+      - readability-*
+      - modernize-*
+    Remove:
+      - modernize-use-trailing-return-type
+  UnusedIncludes: Strict
+  MissingIncludes: Strict
