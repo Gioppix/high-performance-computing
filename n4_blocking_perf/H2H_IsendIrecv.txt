@@ -1,0 +1,22 @@
+Kind				n	time (sec)	Rate (MB/sec)
+head-to-head Isend/Irecv	1	0.000032	0.499318
+head-to-head Isend/Irecv	2	0.000032	1.008413
+head-to-head Isend/Irecv	4	0.000033	1.929469
+head-to-head Isend/Irecv	8	0.000033	3.912825
+head-to-head Isend/Irecv	16	0.000033	7.870891
+head-to-head Isend/Irecv	32	0.000032	15.786576
+head-to-head Isend/Irecv	64	0.000033	31.441927
+head-to-head Isend/Irecv	128	0.000037	55.215374
+head-to-head Isend/Irecv	256	0.000038	107.598346
+head-to-head Isend/Irecv	512	0.000033	247.192362
+head-to-head Isend/Irecv	1024	0.000037	443.351463
+head-to-head Isend/Irecv	2048	0.000040	813.248245
+head-to-head Isend/Irecv	4096	0.000123	534.781920
+head-to-head Isend/Irecv	8192	0.000141	927.075571
+head-to-head Isend/Irecv	16384	0.000273	958.597757
+head-to-head Isend/Irecv	32768	0.000412	1272.582903
+head-to-head Isend/Irecv	65536	0.000707	1482.321035
+head-to-head Isend/Irecv	131072	0.001270	1651.538307
+head-to-head Isend/Irecv	262144	0.002431	1725.400750
+head-to-head Isend/Irecv	524288	0.005163	1624.618926
+head-to-head Isend/Irecv	1048576	0.009976	1681.772960
