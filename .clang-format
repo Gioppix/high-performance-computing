@@ -18,3 +18,4 @@ AlignTrailingComments: true
 AlignConsecutiveAssignments: false
 AlignConsecutiveDeclarations: false
 SortIncludes: true
+IndentPPDirectives: BeforeHash

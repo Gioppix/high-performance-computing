@@ -1,0 +1,9 @@
+// Project tasks configuration. See https://zed.dev/docs/tasks for documentation.
+//
+// Example:
+[
+    {
+        "label": "Compile and run current file",
+        "command": "TMPDIR=$(mktemp -d) && gcc-15 -g -Wall -fopenmp -o $TMPDIR/out $ZED_FILE && time $TMPDIR/out; rm -rf $TMPDIR"
+    }
+]

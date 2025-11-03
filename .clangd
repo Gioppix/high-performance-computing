@@ -1,6 +1,7 @@
 CompileFlags:
   Add:
     - -I/opt/homebrew/Cellar/open-mpi/5.0.8/include
+    - -I/opt/homebrew/opt/libomp/include
     - -DOMPI_SKIP_MPICXX=1
     - -std=c11
     - -Wall
