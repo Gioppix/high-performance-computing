@@ -1,9 +1,10 @@
-// Project tasks configuration. See https://zed.dev/docs/tasks for documentation.
-//
-// Example:
 [
     {
-        "label": "Compile and run current file",
+        "label": "Compile and run C file",
         "command": "TMPDIR=$(mktemp -d) && gcc-15 -g -Wall -fopenmp -o $TMPDIR/out $ZED_FILE && time $TMPDIR/out; rm -rf $TMPDIR"
+    },
+    {
+        "label": "Compile and run C++ file",
+        "command": "TMPDIR=$(mktemp -d) && g++-15 -g -Wall -fopenmp -o $TMPDIR/out $ZED_FILE && time $TMPDIR/out; rm -rf $TMPDIR"
     }
 ]
