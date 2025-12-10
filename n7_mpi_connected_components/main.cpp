@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include <functional>
 #include <iostream>
 #include <omp.h>
 #include <ostream>
@@ -227,6 +228,144 @@ struct Graph {
 
         return result;
     }
+
+    ConnectedComponents get_connected_components_parallel_3(unsigned threads_count,
+                                                            bool print_timing = false) const {
+        const NodeIndex n = nodes.size();
+        const NodeIndex UNCLAIMED = ULLONG_MAX;
+
+        // group[i] = component label for node i (UNCLAIMED if not yet visited)
+        std::vector<std::atomic<NodeIndex>> group(n);
+        // group_neighbors[i] = set of labels that label i is connected to
+        std::vector<std::vector<NodeIndex>> group_neighbors(n);
+
+        double phase_start, phase_end;
+        double phase0_time, phase1_time, phase2_time, phase3_time;
+
+        // Initialization phase
+        phase_start = omp_get_wtime();
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex i = 0; i < n; i++) {
+            group[i].store(UNCLAIMED, std::memory_order_relaxed);
+        }
+        phase_end = omp_get_wtime();
+        phase0_time = phase_end - phase_start;
+
+        // Phase 1: Parallel exploration, record label connections
+        phase_start = omp_get_wtime();
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex start = 0; start < n; start++) {
+            NodeIndex current_label = start;
+            std::vector<NodeIndex> stack;
+            stack.push_back(start);
+
+            while (!stack.empty()) {
+                NodeIndex node = stack.back();
+                stack.pop_back();
+
+                // Try to claim this node
+                NodeIndex expected = UNCLAIMED;
+                if (group[node].compare_exchange_strong(expected, current_label,
+                                                        std::memory_order_relaxed)) {
+                    // Claimed! Add neighbors to stack
+                    for (NodeIndex neighbor : nodes[node].neighbors) {
+                        stack.push_back(neighbor);
+                    }
+                } else if (expected != current_label) {
+                    // Found connection to another component - record in our set (no contention)
+                    group_neighbors[current_label].push_back(expected);
+                }
+            }
+        }
+        phase_end = omp_get_wtime();
+        phase1_time = phase_end - phase_start;
+
+        // Phase 2: Union-Find on labels using group_neighbors
+        phase_start = omp_get_wtime();
+
+        double subphase_start, subphase_end;
+        double phase2_init_time, phase2_union_time, phase2_flatten_time;
+
+        // Subphase 2a: Initialize group_parent
+        subphase_start = omp_get_wtime();
+        std::vector<NodeIndex> group_parent(n);
+        for (NodeIndex i = 0; i < n; i++) {
+            group_parent[i] = i;
+        }
+        subphase_end = omp_get_wtime();
+        phase2_init_time = subphase_end - subphase_start;
+
+        auto find_root = [&](NodeIndex x) -> NodeIndex {
+            while (group_parent[x] != x) {
+                group_parent[x] = group_parent[group_parent[x]];
+                x = group_parent[x];
+            }
+            return x;
+        };
+
+        auto unite = [&](NodeIndex a, NodeIndex b) {
+            NodeIndex ra = find_root(a);
+            NodeIndex rb = find_root(b);
+            if (ra != rb) {
+                if (ra < rb) {
+                    group_parent[rb] = ra;
+                } else {
+                    group_parent[ra] = rb;
+                }
+            }
+        };
+
+        // Subphase 2b: Union operations
+        subphase_start = omp_get_wtime();
+        for (NodeIndex i = 0; i < n; i++) {
+            for (NodeIndex neighbor : group_neighbors[i]) {
+                unite(i, neighbor);
+            }
+        }
+        subphase_end = omp_get_wtime();
+        phase2_union_time = subphase_end - subphase_start;
+
+        // Subphase 2c: Flatten all parents
+        subphase_start = omp_get_wtime();
+        for (NodeIndex i = 0; i < n; i++) {
+            group_parent[i] = find_root(i);
+        }
+        subphase_end = omp_get_wtime();
+        phase2_flatten_time = subphase_end - subphase_start;
+
+        phase_end = omp_get_wtime();
+        phase2_time = phase_end - phase_start;
+
+        // Phase 3: Build result (parallel)
+        phase_start = omp_get_wtime();
+        ConnectedComponents result;
+        result.group.resize(n);
+
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex i = 0; i < n; i++) {
+            result.group[i] = group_parent[group[i].load(std::memory_order_relaxed)];
+        }
+        phase_end = omp_get_wtime();
+        phase3_time = phase_end - phase_start;
+
+        if (print_timing) {
+            std::cout << "  [Phase 0 - Initialization]: " << phase0_time << " seconds\n";
+            std::cout << "  [Phase 1 - Parallel Exploration]: " << phase1_time << " seconds\n";
+            std::cout << "  [Phase 2 - Union-Find]: " << phase2_time << " seconds\n";
+            std::cout << "    [Phase 2a - Init]: " << phase2_init_time << " seconds\n";
+            std::cout << "    [Phase 2b - Union]: " << phase2_union_time << " seconds\n";
+            std::cout << "    [Phase 2c - Flatten]: " << phase2_flatten_time << " seconds\n";
+            std::cout << "  [Phase 3 - Build Result]: " << phase3_time << " seconds\n";
+        }
+
+        return result;
+    }
 };
 
 Graph *create_graph(NodeIndex count, long long edge_count, unsigned threads_count) {
@@ -236,7 +375,10 @@ Graph *create_graph(NodeIndex count, long long edge_count, unsigned threads_coun
     std::vector<std::vector<std::pair<NodeIndex, NodeIndex>>> thread_edges(threads_count);
 
     // Parallel edge generation - just pick random (u, v) pairs directly
-#pragma omp parallel num_threads(threads_count)
+
+    // clang-format off
+    #pragma omp parallel num_threads(threads_count)
+    // clang-format on
     {
         int tid = omp_get_thread_num();
         // Fast xorshift64 RNG
@@ -350,20 +492,79 @@ std::pair<double, ConnectedComponents> benchmark(const char *name, int runs, Fun
     return {avg_time, result};
 }
 
+void test_efficiency_and_scalability(const char *func_name,
+                                     std::function<ConnectedComponents(unsigned)> func,
+                                     unsigned max_threads, int runs) {
+    std::cout << "\n=== Testing Efficiency and Scalability: " << func_name << " ===\n";
+
+    std::vector<double> times(max_threads + 1);
+    std::vector<double> speedups(max_threads + 1);
+    std::vector<double> efficiencies(max_threads + 1);
+
+    // Baseline: single thread
+    auto [t_1, groups_1] = benchmark((std::string(func_name) + " (001 thread)").c_str(), runs,
+                                     [&]() { return func(1); });
+    times[1] = t_1;
+    speedups[1] = 1.0;
+    efficiencies[1] = 1.0;
+
+    std::cout << "  Speedup: 1.00x, Efficiency: 100.00%\n";
+
+    // Test with increasing thread counts
+    for (unsigned tc = 2; tc <= max_threads; tc++) {
+        std::string thread_str = std::to_string(tc);
+        if (tc < 10)
+            thread_str = "00" + thread_str;
+        else if (tc < 100)
+            thread_str = "0" + thread_str;
+
+        auto [t_tc, groups_tc] =
+            benchmark((std::string(func_name) + " (" + thread_str + " threads)").c_str(), runs,
+                      [&]() { return func(tc); });
+
+        times[tc] = t_tc;
+        speedups[tc] = t_1 / t_tc;
+        efficiencies[tc] = speedups[tc] / tc;
+
+        std::cout << "  Speedup: " << speedups[tc]
+                  << "x, Efficiency: " << (efficiencies[tc] * 100.0) << "%\n";
+    }
+
+    // Summary statistics
+    std::cout << "\nSummary:\n";
+    std::cout << "  Best speedup: " << speedups[max_threads] << "x at " << max_threads
+              << " threads\n";
+    std::cout << "  Best efficiency: " << (efficiencies[1] * 100.0) << "% at 1 thread\n";
+
+    // Find thread count with best efficiency/performance tradeoff (efficiency > 50%)
+    unsigned best_tradeoff = 1;
+    for (unsigned tc = 1; tc <= max_threads; tc++) {
+        if (efficiencies[tc] >= 0.5) {
+            best_tradeoff = tc;
+        }
+    }
+    std::cout << "  Best tradeoff (eff >= 50%): " << best_tradeoff << " threads "
+              << "(" << speedups[best_tradeoff] << "x speedup, "
+              << (efficiencies[best_tradeoff] * 100.0) << "% efficiency)\n";
+}
+
 int main() {
-    const NodeIndex NODE_COUNT = 1000000;
-    const long long EDGE_COUNT = NODE_COUNT * 3;
+    const NodeIndex NODE_COUNT = 5000000;
+    const long long EDGE_COUNT = NODE_COUNT * 6;
 
     std::cout << "Node count: " << NODE_COUNT << "\n";
     std::cout << "Edge count: " << EDGE_COUNT << "\n";
 
     const unsigned threads_count = 12;
-    const int RUNS = 5;
+    const int RUNS = 2;
 
     Graph *graph = create_graph(NODE_COUNT, EDGE_COUNT, threads_count);
 
     auto [t_serial, groups_serial] =
         benchmark("Serial", RUNS, [&]() { return graph->get_connected_components_serial(); });
+
+    graph->get_connected_components_parallel_3(threads_count, true);
+    // exit(0);
 
     auto [t_parallel_1, groups_parallel_1] = benchmark("Parallel 1", RUNS, [&]() {
         return graph->get_connected_components_parallel_1(threads_count);
@@ -373,10 +574,25 @@ int main() {
         return graph->get_connected_components_parallel_2(threads_count);
     });
 
+    auto [t_parallel_3, groups_parallel_3] = benchmark("Parallel 3", RUNS, [&]() {
+        return graph->get_connected_components_parallel_3(threads_count);
+    });
+
     // Verify that serial and parallel results are equivalent
-    bool found_different = compare_connected_components(
-        "Serial", groups_serial,
-        {{"Parallel 1", groups_parallel_1}, {"Parallel 2", groups_parallel_2}});
+    bool found_different = compare_connected_components("Serial", groups_serial,
+                                                        {
+                                                            {"Parallel 1", groups_parallel_1},
+                                                            {"Parallel 2", groups_parallel_2},
+                                                            {"Parallel 3", groups_parallel_3},
+                                                        });
+
+    // test_efficiency_and_scalability(
+    //     "Parallel 2", [&](unsigned tc) { return graph->get_connected_components_parallel_2(tc);
+    //     }, threads_count, RUNS);
+
+    // test_efficiency_and_scalability(
+    //     "Parallel 3", [&](unsigned tc) { return graph->get_connected_components_parallel_3(tc);
+    //     }, threads_count, RUNS);
 
     return static_cast<int>(found_different);
 }
