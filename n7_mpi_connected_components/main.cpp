@@ -1,18 +1,26 @@
 #include <algorithm>
+#include <atomic>
+#include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
 #include <omp.h>
+#include <ostream>
+#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+using NodeIndex = unsigned long long;
+
 struct Node {
-    std::vector<unsigned> neighbors;
+    std::vector<NodeIndex> neighbors;
 };
 
 struct ConnectedComponents {
-    std::vector<std::vector<unsigned>> components;
+    // group[i] = component ID for node i (Union-Find root index)
+    std::vector<NodeIndex> group;
 };
 
 struct Graph {
@@ -23,49 +31,49 @@ struct Graph {
 
     ConnectedComponents get_connected_components_serial() const {
         ConnectedComponents result;
+        result.group.resize(nodes.size());
         std::vector<bool> visited(nodes.size(), false);
 
-        for (unsigned i = 0; i < nodes.size(); i++) {
+        for (NodeIndex i = 0; i < nodes.size(); i++) {
             if (!visited[i]) {
-                std::vector<unsigned> component;
-                std::vector<unsigned> stack;
-
+                std::vector<NodeIndex> stack;
                 stack.push_back(i);
                 visited[i] = true;
 
-                while (!stack.empty()) {
-                    unsigned current = stack.back();
-                    stack.pop_back();
-                    component.push_back(current);
+                // Use smallest node index as component ID
+                NodeIndex component_id = i;
 
-                    for (unsigned neighbor : nodes[current].neighbors) {
+                while (!stack.empty()) {
+                    NodeIndex current = stack.back();
+                    stack.pop_back();
+                    result.group[current] = component_id;
+
+                    for (NodeIndex neighbor : nodes[current].neighbors) {
                         if (!visited[neighbor]) {
                             visited[neighbor] = true;
                             stack.push_back(neighbor);
                         }
                     }
                 }
-
-                result.components.push_back(component);
             }
         }
 
         return result;
     }
 
-    ConnectedComponents get_connected_components_parallel(unsigned threads_count) const {
+    ConnectedComponents get_connected_components_parallel_1(unsigned threads_count) const {
         std::vector<omp_lock_t> group_locks(nodes.size());
-        for (unsigned i = 0; i < nodes.size(); i++) {
+        for (NodeIndex i = 0; i < nodes.size(); i++) {
             omp_init_lock(&group_locks[i]);
         }
 
         struct GroupNode {
             GroupNode *parent;
-            unsigned index;
+            NodeIndex index;
         };
 
         std::vector<GroupNode *> groups(nodes.size());
-        for (unsigned i = 0; i < nodes.size(); i++) {
+        for (NodeIndex i = 0; i < nodes.size(); i++) {
             groups[i] = new GroupNode;
             groups[i]->parent = nullptr; // Initialize parent to nullptr (self is root)
             groups[i]->index = i;
@@ -79,12 +87,14 @@ struct Graph {
             return node;
         };
 
-#pragma omp parallel for num_threads(threads_count)
-        for (unsigned node_index = 0; node_index < nodes.size(); node_index++) {
-            for (unsigned adj_index : nodes[node_index].neighbors) {
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex node_index = 0; node_index < nodes.size(); node_index++) {
+            for (NodeIndex adj_index : nodes[node_index].neighbors) {
                 // Lock in consistent order to avoid deadlock
-                unsigned lock_first = std::min(node_index, adj_index);
-                unsigned lock_second = std::max(node_index, adj_index);
+                NodeIndex lock_first = std::min(node_index, adj_index);
+                NodeIndex lock_second = std::max(node_index, adj_index);
 
                 omp_set_lock(&group_locks[lock_first]);
                 omp_set_lock(&group_locks[lock_second]);
@@ -108,157 +118,265 @@ struct Graph {
         }
 
         ConnectedComponents result;
+        result.group.resize(nodes.size());
 
-        // Find root for each node and group nodes by their root
-        std::vector<unsigned> roots(nodes.size());
-        for (unsigned i = 0; i < nodes.size(); i++) {
+        // Find root for each node - this IS the group ID
+        for (NodeIndex i = 0; i < nodes.size(); i++) {
             GroupNode *current = groups[i];
             while (current->parent != nullptr) {
                 current = current->parent;
             }
-            roots[i] = current->index;
+            result.group[i] = current->index;
         }
 
-        // Map roots to component indices using hash map for O(1) lookup
-        std::unordered_map<unsigned, unsigned> root_to_component;
-        for (unsigned i = 0; i < nodes.size(); i++) {
-            if (root_to_component.find(roots[i]) == root_to_component.end()) {
-                root_to_component[roots[i]] = result.components.size();
-                result.components.push_back(std::vector<unsigned>());
+        return result;
+    }
+
+    ConnectedComponents get_connected_components_parallel_2(unsigned threads_count) const {
+        const NodeIndex n = nodes.size();
+        const NodeIndex UNCLAIMED = ULLONG_MAX;
+
+        // group[i] = component label for node i (UNCLAIMED if not yet visited)
+        std::vector<std::atomic<NodeIndex>> group(n);
+        // group_neighbors[i] = set of labels that label i is connected to
+        std::vector<std::set<NodeIndex>> group_neighbors(n);
+
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex i = 0; i < n; i++) {
+            group[i].store(UNCLAIMED, std::memory_order_relaxed);
+        }
+
+        // Phase 1: Parallel exploration, record label connections
+
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex start = 0; start < n; start++) {
+            NodeIndex current_label = start;
+            std::vector<NodeIndex> stack;
+            stack.push_back(start);
+
+            while (!stack.empty()) {
+                NodeIndex node = stack.back();
+                stack.pop_back();
+
+                // Try to claim this node
+                NodeIndex expected = UNCLAIMED;
+                if (group[node].compare_exchange_strong(expected, current_label,
+                                                        std::memory_order_relaxed)) {
+                    // Claimed! Add neighbors to stack
+                    for (NodeIndex neighbor : nodes[node].neighbors) {
+                        stack.push_back(neighbor);
+                    }
+                } else if (expected != current_label) {
+                    // Found connection to another component - record in our set (no contention)
+                    group_neighbors[current_label].insert(expected);
+                }
             }
         }
 
-        // Assign nodes to their components
-        for (unsigned i = 0; i < nodes.size(); i++) {
-            result.components[root_to_component[roots[i]]].push_back(i);
+        // Phase 2: Union-Find on labels using group_neighbors
+        std::vector<NodeIndex> group_parent(n);
+        for (NodeIndex i = 0; i < n; i++) {
+            group_parent[i] = i;
         }
 
-        // Clean up
-        for (unsigned i = 0; i < nodes.size(); i++) {
-            delete groups[i];
+        auto find_root = [&](NodeIndex x) -> NodeIndex {
+            while (group_parent[x] != x) {
+                group_parent[x] = group_parent[group_parent[x]];
+                x = group_parent[x];
+            }
+            return x;
+        };
+
+        auto unite = [&](NodeIndex a, NodeIndex b) {
+            NodeIndex ra = find_root(a);
+            NodeIndex rb = find_root(b);
+            if (ra != rb) {
+                if (ra < rb) {
+                    group_parent[rb] = ra;
+                } else {
+                    group_parent[ra] = rb;
+                }
+            }
+        };
+
+        for (NodeIndex i = 0; i < n; i++) {
+            for (NodeIndex neighbor : group_neighbors[i]) {
+                unite(i, neighbor);
+            }
         }
-        for (unsigned i = 0; i < nodes.size(); i++) {
-            omp_destroy_lock(&group_locks[i]);
+
+        // Flatten all parents
+        for (NodeIndex i = 0; i < n; i++) {
+            group_parent[i] = find_root(i);
         }
+
+        // Phase 3: Build result (parallel)
+        ConnectedComponents result;
+        result.group.resize(n);
+
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex i = 0; i < n; i++) {
+            result.group[i] = group_parent[group[i].load(std::memory_order_relaxed)];
+        }
+
         return result;
     }
 };
 
-Graph *create_graph(unsigned count, int edge_count) {
+Graph *create_graph(NodeIndex count, long long edge_count, unsigned threads_count) {
     std::vector<Node> nodes(count);
-    std::srand(0);
 
-    // Total possible edges in undirected graph without self-loops
-    long long total_edges = static_cast<long long>(count) * (count - 1) / 2;
+    // Thread-local edge lists to avoid contention
+    std::vector<std::vector<std::pair<NodeIndex, NodeIndex>>> thread_edges(threads_count);
 
-    if (edge_count > total_edges) {
-        std::cerr << "ERROR: edge_count (" << edge_count << ") exceeds total possible edges ("
-                  << total_edges << ")\n";
-        std::exit(1);
+    // Parallel edge generation - just pick random (u, v) pairs directly
+#pragma omp parallel num_threads(threads_count)
+    {
+        int tid = omp_get_thread_num();
+        // Fast xorshift64 RNG
+        uint64_t rng = 12345ULL + tid * 1000003ULL;
+        auto fast_rand = [&rng](NodeIndex max) -> NodeIndex {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            return rng % max;
+        };
+
+        long long my_edges =
+            (edge_count * (tid + 1)) / threads_count - (edge_count * tid) / threads_count;
+        thread_edges[tid].reserve(my_edges);
+
+        for (long long i = 0; i < my_edges; i++) {
+            NodeIndex u = fast_rand(count);
+            NodeIndex v = fast_rand(count - 1);
+            if (v >= u)
+                v++; // Ensure v != u
+            thread_edges[tid].emplace_back(u, v);
+        }
     }
 
-    // Use hash map for O(1) swap lookups - virtual Fisher-Yates without full array
-    // Only stores elements that have been swapped, rest are implicitly identity
-    std::unordered_map<long long, long long> swapped;
-
-    auto get_value = [&swapped](long long idx) -> long long {
-        auto it = swapped.find(idx);
-        return it != swapped.end() ? it->second : idx;
-    };
-
-    auto index_to_edge = [count](long long idx) -> std::pair<unsigned, unsigned> {
-        unsigned u = 0;
-        long long edges_before_u = 0;
-        while (edges_before_u + (count - 1 - u) <= idx) {
-            edges_before_u += (count - 1 - u);
-            u++;
+    // Merge into graph
+    for (unsigned t = 0; t < threads_count; t++) {
+        for (auto [u, v] : thread_edges[t]) {
+            nodes[u].neighbors.push_back(v);
+            nodes[v].neighbors.push_back(u);
         }
-        unsigned v = u + 1 + (idx - edges_before_u);
-        return {u, v};
-    };
-
-    // Virtual Fisher-Yates: only track swapped positions
-    for (int i = 0; i < edge_count; i++) {
-        long long j = i + rand() % (total_edges - i);
-
-        long long val_i = get_value(i);
-        long long val_j = get_value(j);
-
-        // Swap
-        swapped[i] = val_j;
-        if (j != i) {
-            swapped[j] = val_i;
-        }
-
-        // Add edge
-        auto [u, v] = index_to_edge(val_j);
-        nodes[u].neighbors.push_back(v);
-        nodes[v].neighbors.push_back(u);
     }
 
     return new Graph(nodes);
 }
 
-int main() {
-    const int NODE_COUNT = 10000;
-    const double PERCENTAGE_CONNECTED = 0.75;
-    const int EDGE_COUNT =
-        static_cast<int>(NODE_COUNT * (NODE_COUNT - 1) / 2 * PERCENTAGE_CONNECTED);
+// Normalize group labels: first seen label -> 0, second -> 1, etc.
+std::vector<NodeIndex> normalize_groups(const std::vector<NodeIndex> &group) {
+    std::vector<NodeIndex> result(group.size());
+    std::unordered_map<NodeIndex, NodeIndex> label_map;
+    NodeIndex next_label = 0;
 
-    const unsigned threads_count = 12;
+    for (size_t i = 0; i < group.size(); i++) {
+        auto it = label_map.find(group[i]);
+        if (it == label_map.end()) {
+            label_map[group[i]] = next_label++;
+        }
+        result[i] = label_map[group[i]];
+    }
+    return result;
+}
 
-    Graph *graph = create_graph(NODE_COUNT, EDGE_COUNT);
+bool compare_connected_components(
+    const char *source_name, const ConnectedComponents &source,
+    const std::vector<std::pair<const char *, ConnectedComponents>> &others) {
+    auto source_normalized = normalize_groups(source.group);
 
-    double start_time = omp_get_wtime();
+    std::cout << "Number of groups: "
+              << std::set<NodeIndex>(source_normalized.begin(), source_normalized.end()).size()
+              << "\n";
 
-    auto groups_serial = graph->get_connected_components_serial();
+    bool found_different = false;
 
-    double end_time = omp_get_wtime();
+    for (const auto &[other_name, other] : others) {
+        if (source.group.size() != other.group.size()) {
+            std::cout << "ERROR: " << source_name << " vs " << other_name << " - size mismatch ("
+                      << source.group.size() << " vs " << other.group.size() << ")\n";
+            continue;
+        }
 
-    std::cout << "Serial time: " << (end_time - start_time) << " seconds\n";
+        auto other_normalized = normalize_groups(other.group);
+        bool match = true;
+        for (size_t i = 0; i < source_normalized.size(); i++) {
+            if (source_normalized[i] != other_normalized[i]) {
+                found_different = true;
 
-    start_time = omp_get_wtime();
-
-    auto groups_parallel = graph->get_connected_components_parallel(threads_count);
-
-    end_time = omp_get_wtime();
-
-    std::cout << "Parallel time: " << (end_time - start_time) << " seconds\n";
-
-    // Verify that serial and parallel results are equivalent
-    if (groups_serial.components.size() != groups_parallel.components.size()) {
-        std::cout << "ERROR: Different number of components! Serial: "
-                  << groups_serial.components.size()
-                  << ", Parallel: " << groups_parallel.components.size() << "\n";
-    } else {
-        // Sort components for comparison
-        auto sort_components = [](ConnectedComponents &cc) {
-            for (auto &comp : cc.components) {
-                std::sort(comp.begin(), comp.end());
-            }
-            std::sort(cc.components.begin(), cc.components.end());
-        };
-
-        sort_components(groups_serial);
-        sort_components(groups_parallel);
-
-        bool equal = true;
-        for (size_t i = 0; i < groups_serial.components.size(); i++) {
-            if (groups_serial.components[i] != groups_parallel.components[i]) {
-                equal = false;
+                std::cout << "ERROR: " << source_name << " vs " << other_name
+                          << " - mismatch at index " << i << " (group " << source_normalized[i]
+                          << " vs " << other_normalized[i] << ")\n";
+                match = false;
                 break;
             }
         }
-
-        if (equal) {
-            std::cout << "SUCCESS: Serial and parallel results are equivalent!\n";
-        } else {
-            std::cout << "ERROR: Serial and parallel results differ!\n";
+        if (match) {
+            std::cout << "OK: " << source_name << " == " << other_name << "\n";
         }
     }
 
-    // #pragma omp parallel for num_threads(thread_count) reduction(&& : all_reach_one)
-    // #pragma omp critical
+    return found_different;
+}
 
-    return 0;
+template <typename Func>
+std::pair<double, ConnectedComponents> benchmark(const char *name, int runs, Func func) {
+    ConnectedComponents result;
+    double total_time = 0;
+    std::vector<double> iteration_times;
+
+    for (int i = 0; i < runs; i++) {
+        double start = omp_get_wtime();
+        result = func();
+        double end = omp_get_wtime();
+        double iteration_time = end - start;
+        total_time += iteration_time;
+        iteration_times.push_back(iteration_time);
+    }
+
+    double avg_time = total_time / runs;
+    std::cout << name << ": " << avg_time << " seconds (avg of " << runs << " runs)\n";
+    for (int i = 0; i < runs; i++) {
+        // std::cout << "  Run " << (i + 1) << ": " << iteration_times[i] << " seconds\n";
+    }
+    return {avg_time, result};
+}
+
+int main() {
+    const NodeIndex NODE_COUNT = 1000000;
+    const long long EDGE_COUNT = NODE_COUNT * 3;
+
+    std::cout << "Node count: " << NODE_COUNT << "\n";
+    std::cout << "Edge count: " << EDGE_COUNT << "\n";
+
+    const unsigned threads_count = 12;
+    const int RUNS = 5;
+
+    Graph *graph = create_graph(NODE_COUNT, EDGE_COUNT, threads_count);
+
+    auto [t_serial, groups_serial] =
+        benchmark("Serial", RUNS, [&]() { return graph->get_connected_components_serial(); });
+
+    auto [t_parallel_1, groups_parallel_1] = benchmark("Parallel 1", RUNS, [&]() {
+        return graph->get_connected_components_parallel_1(threads_count);
+    });
+
+    auto [t_parallel_2, groups_parallel_2] = benchmark("Parallel 2", RUNS, [&]() {
+        return graph->get_connected_components_parallel_2(threads_count);
+    });
+
+    // Verify that serial and parallel results are equivalent
+    bool found_different = compare_connected_components(
+        "Serial", groups_serial,
+        {{"Parallel 1", groups_parallel_1}, {"Parallel 2", groups_parallel_2}});
+
+    return static_cast<int>(found_different);
 }
