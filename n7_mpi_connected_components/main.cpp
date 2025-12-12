@@ -368,47 +368,87 @@ struct Graph {
     }
 };
 
-Graph *create_graph(NodeIndex count, long long edge_count, unsigned threads_count) {
+Graph *create_graph(NodeIndex count, long long edge_count) {
     std::vector<Node> nodes(count);
 
-    // Thread-local edge lists to avoid contention
-    std::vector<std::vector<std::pair<NodeIndex, NodeIndex>>> thread_edges(threads_count);
+    // Use srand with a fixed seed for reproducibility
+    const unsigned int RANDOM_SEED = 12345;
+    std::srand(RANDOM_SEED);
 
-    // Parallel edge generation - just pick random (u, v) pairs directly
+    // Union-Find structure to track connected components cheaply
+    std::vector<NodeIndex> parent(count);
+    std::vector<NodeIndex> component_size(count);
 
-    // clang-format off
-    #pragma omp parallel num_threads(threads_count)
-    // clang-format on
-    {
-        int tid = omp_get_thread_num();
-        // Fast xorshift64 RNG
-        uint64_t rng = 12345ULL + tid * 1000003ULL;
-        auto fast_rand = [&rng](NodeIndex max) -> NodeIndex {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            return rng % max;
-        };
-
-        long long my_edges =
-            (edge_count * (tid + 1)) / threads_count - (edge_count * tid) / threads_count;
-        thread_edges[tid].reserve(my_edges);
-
-        for (long long i = 0; i < my_edges; i++) {
-            NodeIndex u = fast_rand(count);
-            NodeIndex v = fast_rand(count - 1);
-            if (v >= u)
-                v++; // Ensure v != u
-            thread_edges[tid].emplace_back(u, v);
-        }
+    // Initialize each node as its own component
+    for (NodeIndex idx = 0; idx < count; idx++) {
+        parent[idx] = idx;
+        component_size[idx] = 1;
     }
 
-    // Merge into graph
-    for (unsigned t = 0; t < threads_count; t++) {
-        for (auto [u, v] : thread_edges[t]) {
-            nodes[u].neighbors.push_back(v);
-            nodes[v].neighbors.push_back(u);
+    // Find root with path compression
+    std::function<NodeIndex(NodeIndex)> find_root = [&](NodeIndex node_idx) -> NodeIndex {
+        if (parent[node_idx] != node_idx) {
+            parent[node_idx] = find_root(parent[node_idx]);
         }
+        return parent[node_idx];
+    };
+
+    // Union two components
+    auto unite = [&](NodeIndex node_u, NodeIndex node_v) {
+        NodeIndex root_u = find_root(node_u);
+        NodeIndex root_v = find_root(node_v);
+
+        if (root_u != root_v) {
+            // Merge smaller into larger
+            if (component_size[root_u] < component_size[root_v]) {
+                parent[root_u] = root_v;
+                component_size[root_v] += component_size[root_u];
+            } else {
+                parent[root_v] = root_u;
+                component_size[root_u] += component_size[root_v];
+            }
+        }
+    };
+
+    // Generate edges with preference for isolated nodes
+    for (long long idx = 0; idx < edge_count; idx++) {
+        NodeIndex node_u, node_v;
+
+        // Select nodes with probability inversely proportional to their component size
+        // Use rejection sampling to favor smaller components
+        auto select_node_weighted = [&]() -> NodeIndex {
+            NodeIndex candidate;
+            NodeIndex candidate_root;
+            NodeIndex candidate_size;
+
+            // Try up to 10 times to get a good candidate (from small component)
+            NodeIndex best_candidate = static_cast<NodeIndex>(std::rand()) % count;
+            NodeIndex best_size = component_size[find_root(best_candidate)];
+
+            for (int attempt = 0; attempt < 10; attempt++) {
+                candidate = static_cast<NodeIndex>(std::rand()) % count;
+                candidate_root = find_root(candidate);
+                candidate_size = component_size[candidate_root];
+
+                // Keep candidate if it's in a smaller component
+                if (candidate_size < best_size) {
+                    best_candidate = candidate;
+                    best_size = candidate_size;
+                }
+            }
+
+            return best_candidate;
+        };
+
+        node_u = select_node_weighted();
+        node_v = select_node_weighted();
+
+        // Add edge
+        nodes[node_u].neighbors.push_back(node_v);
+        nodes[node_v].neighbors.push_back(node_u);
+
+        // Update component information
+        unite(node_u, node_v);
     }
 
     return new Graph(nodes);
@@ -548,51 +588,179 @@ void test_efficiency_and_scalability(const char *func_name,
               << (efficiencies[best_tradeoff] * 100.0) << "% efficiency)\n";
 }
 
+struct TestResult {
+    double avg_time;
+    bool correct;
+    size_t component_count;
+};
+
+// Returns true if A and B represent the same connectivity
+bool verify_equivalence(const std::vector<NodeIndex> &baseline,
+                        const std::vector<NodeIndex> &target) {
+    if (baseline.size() != target.size())
+        return false;
+
+    // We normalize both. If they are identical graphs, the normalized forms must be identical.
+    auto norm_base = normalize_groups(baseline);
+    auto norm_targ = normalize_groups(target);
+
+    return norm_base == norm_targ;
+}
+
+TestResult run_benchmark(const char *algo_name, std::function<ConnectedComponents()> func, int runs,
+                         const std::vector<NodeIndex> *baseline_groups = nullptr) {
+
+    double total_time = 0;
+    ConnectedComponents result;
+
+    // Warmup / First run (used for correctness check)
+    double start = omp_get_wtime();
+    result = func();
+    double end = omp_get_wtime();
+    total_time += (end - start);
+
+    bool correct = true;
+    if (baseline_groups) {
+        correct = verify_equivalence(*baseline_groups, result.group);
+        if (!correct) {
+            std::cerr << "  [ERROR] " << algo_name << " result mismatch!\n";
+        }
+    }
+
+    // Remaining runs for timing
+    for (int i = 1; i < runs; i++) {
+        start = omp_get_wtime();
+        // We ignore the result of subsequent runs to save memory/time,
+        // strictly measuring execution speed.
+        auto dummy = func();
+        end = omp_get_wtime();
+        total_time += (end - start);
+    }
+
+    // Calculate unique components for reporting
+    size_t unique_count = 0;
+    if (baseline_groups == nullptr) {
+        // Only strictly calculate this for the serial/baseline to avoid overhead on every run
+        // Using the optimized normalizer logic to count
+        std::vector<NodeIndex> map(result.group.size(), ULLONG_MAX);
+        for (auto g : result.group) {
+            if (map[g] == ULLONG_MAX) {
+                map[g] = 1;
+                unique_count++;
+            }
+        }
+    }
+
+    return {total_time / runs, correct, unique_count};
+}
+
+#include <iomanip>
+#include <string>
+
 int main() {
-    const NodeIndex NODE_COUNT = 5000000;
-    const long long EDGE_COUNT = NODE_COUNT * 6;
+    // ---------------- CONFIGURATION ---------------- //
+    const std::vector<NodeIndex> NODE_COUNTS = {50000, 500000, 5000000};
+    // const std::vector<NodeIndex> NODE_COUNTS = {2.5M, 5m, 10m, 20m, 40m, 80, 160m};
+    const std::vector<double> EDGE_RATIOS = {0.1, 0.5, 1.0, 2.0};
+    // pack exclusive
+    // processors: 1,2,4,8,16,...,64
+    const int RUNS = 3;
 
-    std::cout << "Node count: " << NODE_COUNT << "\n";
-    std::cout << "Edge count: " << EDGE_COUNT << "\n";
+    // Set threads.
+    const std::vector<int> THREAD_COUNTS = {1, 2, 7, 12};
+    const int MAX_THREADS = 12;
 
-    const unsigned threads_count = 12;
-    const int RUNS = 2;
-
-    Graph *graph = create_graph(NODE_COUNT, EDGE_COUNT, threads_count);
-
-    auto [t_serial, groups_serial] =
-        benchmark("Serial", RUNS, [&]() { return graph->get_connected_components_serial(); });
-
-    graph->get_connected_components_parallel_3(threads_count, true);
+    // // Plot 500000 random numbers using srand and fixed seed, csv
+    // std::srand(12345);
+    // std::cout << "Index,RandomNumber\n";
+    // for (int i = 0; i < 50000; i++) {
+    //     std::cout << i << "," << std::rand() % 50000 << "\n";
+    // }
     // exit(0);
 
-    auto [t_parallel_1, groups_parallel_1] = benchmark("Parallel 1", RUNS, [&]() {
-        return graph->get_connected_components_parallel_1(threads_count);
-    });
+    // CSV Header
+    std::cout << "Nodes,Ratio,Edges,Comps,Threads,Algorithm,Time,Speedup,Status\n";
 
-    auto [t_parallel_2, groups_parallel_2] = benchmark("Parallel 2", RUNS, [&]() {
-        return graph->get_connected_components_parallel_2(threads_count);
-    });
+    Graph *graph = create_graph(50000, 50000);
 
-    auto [t_parallel_3, groups_parallel_3] = benchmark("Parallel 3", RUNS, [&]() {
-        return graph->get_connected_components_parallel_3(threads_count);
-    });
+    auto components = graph->get_connected_components_serial();
 
-    // Verify that serial and parallel results are equivalent
-    bool found_different = compare_connected_components("Serial", groups_serial,
-                                                        {
-                                                            {"Parallel 1", groups_parallel_1},
-                                                            {"Parallel 2", groups_parallel_2},
-                                                            {"Parallel 3", groups_parallel_3},
-                                                        });
+    // Print component sizes as CSV
+    std::unordered_map<NodeIndex, size_t> component_sizes;
+    for (NodeIndex comp_id : components.group) {
+        component_sizes[comp_id]++;
+    }
 
-    // test_efficiency_and_scalability(
-    //     "Parallel 2", [&](unsigned tc) { return graph->get_connected_components_parallel_2(tc);
-    //     }, threads_count, RUNS);
+    std::cout << "ComponentID,Size\n";
+    for (std::unordered_map<NodeIndex, size_t>::const_iterator it = component_sizes.begin();
+         it != component_sizes.end(); ++it) {
+        std::cout << it->first << "," << it->second << "\n";
+    }
 
-    // test_efficiency_and_scalability(
-    //     "Parallel 3", [&](unsigned tc) { return graph->get_connected_components_parallel_3(tc);
-    //     }, threads_count, RUNS);
+    exit(0);
 
-    return static_cast<int>(found_different);
+    for (NodeIndex n_count : NODE_COUNTS) {
+        for (double ratio : EDGE_RATIOS) {
+            long long e_count = static_cast<long long>(n_count * ratio);
+
+            // 1. Create Graph (Reuse for all algos in this batch)
+            // Use max threads for faster graph generation
+            Graph *graph = create_graph(n_count, e_count);
+
+            // 2. Run Serial Baseline
+            using AlgoFunc = std::function<ConnectedComponents()>;
+            AlgoFunc serial_func = [&]() { return graph->get_connected_components_serial(); };
+
+            TestResult serial_res = run_benchmark("Serial", serial_func, RUNS, nullptr);
+
+            // Get baseline groups for verification (requires one more run to capture output)
+            std::vector<NodeIndex> baseline_groups = graph->get_connected_components_serial().group;
+
+            // 3. Run with 1 thread as baseline for speedup calculation
+            AlgoFunc parallel3_1thread = [&]() {
+                return graph->get_connected_components_parallel_3(1, false);
+            };
+            TestResult baseline_res =
+                run_benchmark("Parallel3_1thread", parallel3_1thread, RUNS, &baseline_groups);
+
+            // Output Serial Row (shown for completeness, but speedup relative to 1-thread parallel)
+            double serial_speedup = baseline_res.avg_time / serial_res.avg_time;
+            std::cout << n_count << "," << ratio << "," << e_count << ","
+                      << serial_res.component_count << ",1,Serial," << std::fixed
+                      << std::setprecision(5) << serial_res.avg_time << "," << std::setprecision(2)
+                      << serial_speedup << "," << (serial_res.correct ? "OK" : "FAIL") << "\n";
+
+            // 4. Run Parallel Algorithms with Variable Threads (including 1 thread)
+            for (int t_count : THREAD_COUNTS) {
+                struct AlgoDef {
+                    std::string name;
+                    AlgoFunc func;
+                };
+
+                std::vector<AlgoDef> par_algos = {
+                    {"Parallel2",
+                     [&]() { return graph->get_connected_components_parallel_2(t_count); }},
+                    {"Parallel3",
+                     [&]() { return graph->get_connected_components_parallel_3(t_count, false); }}};
+
+                for (const auto &alg : par_algos) {
+                    TestResult res =
+                        run_benchmark(alg.name.c_str(), alg.func, RUNS, &baseline_groups);
+
+                    // Speedup relative to 1-thread baseline
+                    double speedup = baseline_res.avg_time / res.avg_time;
+
+                    std::cout << n_count << "," << ratio << "," << e_count << ","
+                              << serial_res.component_count << "," << t_count << "," << alg.name
+                              << "," << std::fixed << std::setprecision(5) << res.avg_time << ","
+                              << std::setprecision(2) << speedup << ","
+                              << (res.correct ? "OK" : "FAIL") << "\n";
+                }
+            }
+
+            delete graph;
+        }
+    }
+
+    return 0;
 }
