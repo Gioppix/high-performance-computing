@@ -366,6 +366,248 @@ struct Graph {
 
         return result;
     }
+
+    ConnectedComponents get_connected_components_Shiloach_Vishkin(unsigned threads_count) const {
+        const NodeIndex n = nodes.size();
+
+        std::vector<std::atomic<NodeIndex>> parent(n);
+
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex i = 0; i < n; i++) {
+            parent[i].store(i, std::memory_order_relaxed);
+        }
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+
+            // Use local flag + reduction to fix Data Race and False Sharing
+            bool hook_changed = false;
+
+            // Hooking phase
+
+            // clang-format off
+            #pragma omp parallel for num_threads(threads_count) reduction(|| : hook_changed)
+            // clang-format on
+            for (NodeIndex u = 0; u < n; u++) {
+                NodeIndex parent_u = parent[u].load(std::memory_order_relaxed);
+
+                for (NodeIndex v : nodes[u].neighbors) {
+                    NodeIndex parent_v = parent[v].load(std::memory_order_relaxed);
+
+                    if (parent_u != parent_v) {
+                        // We attempt to update the GRANDPARENT.
+                        // This effectively merges the tree rooted at parent[u] into parent[v].
+
+                        // Case 1: parent_u > parent_v. Try to pull parent_u down to parent_v.
+                        if (parent_u > parent_v) {
+                            NodeIndex p_p_u = parent[parent_u].load(std::memory_order_relaxed);
+                            // Only update if it improves the value (min-index rule)
+                            while (p_p_u > parent_v) {
+                                if (parent[parent_u].compare_exchange_weak(
+                                        p_p_u, parent_v, std::memory_order_relaxed)) {
+                                    hook_changed = true;
+                                    break;
+                                }
+                                // If CAS fails, p_p_u is automatically updated to the new value in
+                                // memory. The loop condition (p_p_u > parent_v) re-checks if we
+                                // still need to write.
+                            }
+                        }
+                        // Case 2: parent_v > parent_u. Try to pull parent_v down to parent_u.
+                        else {
+                            NodeIndex p_p_v = parent[parent_v].load(std::memory_order_relaxed);
+                            while (p_p_v > parent_u) {
+                                if (parent[parent_v].compare_exchange_weak(
+                                        p_p_v, parent_u, std::memory_order_relaxed)) {
+                                    hook_changed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Shortcutting phase
+            bool shortcut_changed = false;
+
+            // clang-format off
+            #pragma omp parallel for num_threads(threads_count) reduction(|| : shortcut_changed)
+            // clang-format on
+            for (NodeIndex u = 0; u < n; u++) {
+                NodeIndex parent_u = parent[u].load(std::memory_order_relaxed);
+                NodeIndex grandparent_u = parent[parent_u].load(std::memory_order_relaxed);
+
+                if (parent_u != grandparent_u) {
+                    // Path compression: Point u directly to grandparent
+                    parent[u].store(grandparent_u, std::memory_order_relaxed);
+                    shortcut_changed = true;
+                }
+            }
+
+            changed = hook_changed || shortcut_changed;
+        }
+
+        // Build result
+        ConnectedComponents result;
+        result.group.resize(n);
+
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex i = 0; i < n; i++) {
+            NodeIndex root = i;
+            NodeIndex parent_val = parent[root].load(std::memory_order_relaxed);
+            while (parent_val != root) {
+                root = parent_val;
+                parent_val = parent[root].load(std::memory_order_relaxed);
+            }
+            result.group[i] = root;
+        }
+
+        return result;
+    }
+
+    ConnectedComponents get_connected_components_SV_impr(unsigned threads_count) const {
+        const NodeIndex n = nodes.size();
+
+        // Afforest algorithm: SV with subgraph sampling
+        std::vector<std::atomic<NodeIndex>> parent(n);
+
+        // Initialize parent array
+
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex i = 0; i < n; i++) {
+            parent[i].store(i, std::memory_order_relaxed);
+        }
+
+        // Helper: link procedure
+        auto link = [&](NodeIndex u, NodeIndex v) {
+            NodeIndex p1 = parent[u].load(std::memory_order_relaxed);
+            NodeIndex p2 = parent[v].load(std::memory_order_relaxed);
+
+            while (p1 != p2) {
+                NodeIndex h = std::max(p1, p2);
+                NodeIndex l = std::min(p1, p2);
+
+                NodeIndex expected = h;
+                if (parent[h].compare_exchange_weak(expected, l, std::memory_order_relaxed)) {
+                    break;
+                }
+
+                p1 = parent[parent[h].load(std::memory_order_relaxed)].load(
+                    std::memory_order_relaxed);
+                p2 = parent[l].load(std::memory_order_relaxed);
+            }
+        };
+
+        // Helper: compress procedure
+        auto compress = [&](NodeIndex v) {
+            NodeIndex parent_v = parent[v].load(std::memory_order_relaxed);
+            NodeIndex grandparent_v = parent[parent_v].load(std::memory_order_relaxed);
+
+            while (parent_v != grandparent_v) {
+                parent[v].store(grandparent_v, std::memory_order_relaxed);
+                parent_v = grandparent_v;
+                grandparent_v = parent[parent_v].load(std::memory_order_relaxed);
+            }
+        };
+
+        // Phase 1: Neighbor sampling rounds (2 rounds)
+        const int neighbor_rounds = 2;
+
+        for (int round = 0; round < neighbor_rounds; round++) {
+            // Link phase: process first 'round+1' neighbors
+
+            // clang-format off
+            #pragma omp parallel for num_threads(threads_count)
+            // clang-format on
+            for (NodeIndex u = 0; u < n; u++) {
+                if (round < nodes[u].neighbors.size()) {
+                    NodeIndex v = nodes[u].neighbors[round];
+                    link(u, v);
+                }
+            }
+
+            // Compress phase
+
+            // clang-format off
+            #pragma omp parallel for num_threads(threads_count)
+            // clang-format on
+            for (NodeIndex v = 0; v < n; v++) {
+                compress(v);
+            }
+        }
+
+        // Phase 2: Find largest component (probabilistic sampling)
+        NodeIndex largest_component = 0;
+        {
+            std::unordered_map<NodeIndex, NodeIndex> component_count;
+            const int sample_size = std::min(n, NodeIndex(10000));
+
+            for (NodeIndex i = 0; i < sample_size; i++) {
+                NodeIndex sample_idx = (i * n) / sample_size;
+                NodeIndex comp = parent[sample_idx].load(std::memory_order_relaxed);
+                component_count[comp]++;
+            }
+
+            NodeIndex max_count = 0;
+            for (const auto &[comp, count] : component_count) {
+                if (count > max_count) {
+                    max_count = count;
+                    largest_component = comp;
+                }
+            }
+        }
+
+        // Phase 3: Process remaining edges, skipping largest component
+
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex u = 0; u < n; u++) {
+            NodeIndex parent_u = parent[u].load(std::memory_order_relaxed);
+            if (parent_u != largest_component) {
+                for (size_t i = neighbor_rounds; i < nodes[u].neighbors.size(); i++) {
+                    NodeIndex v = nodes[u].neighbors[i];
+                    link(u, v);
+                }
+            }
+        }
+
+        // Final compress
+
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex v = 0; v < n; v++) {
+            compress(v);
+        }
+
+        // Build result
+        ConnectedComponents result;
+        result.group.resize(n);
+
+        // clang-format off
+        #pragma omp parallel for num_threads(threads_count)
+        // clang-format on
+        for (NodeIndex i = 0; i < n; i++) {
+            NodeIndex root = i;
+            NodeIndex parent_val = parent[root].load(std::memory_order_relaxed);
+            while (parent_val != root) {
+                root = parent_val;
+                parent_val = parent[root].load(std::memory_order_relaxed);
+            }
+            result.group[i] = root;
+        }
+
+        return result;
+    }
 };
 
 Graph *create_graph(NodeIndex count, long long edge_count) {
@@ -659,7 +901,11 @@ TestResult run_benchmark(const char *algo_name, std::function<ConnectedComponent
 
 int main() {
     // ---------------- CONFIGURATION ---------------- //
-    const std::vector<NodeIndex> NODE_COUNTS = {50000, 500000, 5000000};
+    const std::vector<NodeIndex> NODE_COUNTS = {
+        50000,
+        500000,
+        5000000,
+    };
     // const std::vector<NodeIndex> NODE_COUNTS = {2.5M, 5m, 10m, 20m, 40m, 80, 160m};
     const std::vector<double> EDGE_RATIOS = {0.1, 0.5, 1.0, 2.0};
     // pack exclusive
@@ -667,44 +913,35 @@ int main() {
     const int RUNS = 3;
 
     // Set threads.
-    const std::vector<int> THREAD_COUNTS = {1, 2, 7, 12};
+    const std::vector<int> THREAD_COUNTS = {1, 2, 6, 12};
     const int MAX_THREADS = 12;
 
-    // // Plot 500000 random numbers using srand and fixed seed, csv
-    // std::srand(12345);
-    // std::cout << "Index,RandomNumber\n";
-    // for (int i = 0; i < 50000; i++) {
-    //     std::cout << i << "," << std::rand() % 50000 << "\n";
+    // Graph *graph = create_graph(5000000, 2500000);
+
+    // auto components = graph->get_connected_components_serial();
+
+    // // Print component sizes as CSV
+    // std::unordered_map<NodeIndex, size_t> component_sizes;
+    // for (NodeIndex comp_id : components.group) {
+    //     component_sizes[comp_id]++;
     // }
+
+    // std::cout << "ComponentID,Size\n";
+    // for (std::unordered_map<NodeIndex, size_t>::const_iterator it = component_sizes.begin();
+    //      it != component_sizes.end(); ++it) {
+    //     std::cout << it->first << "," << it->second << "\n";
+    // }
+
     // exit(0);
 
     // CSV Header
-    std::cout << "Nodes,Ratio,Edges,Comps,Threads,Algorithm,Time,Speedup,Status\n";
-
-    Graph *graph = create_graph(50000, 50000);
-
-    auto components = graph->get_connected_components_serial();
-
-    // Print component sizes as CSV
-    std::unordered_map<NodeIndex, size_t> component_sizes;
-    for (NodeIndex comp_id : components.group) {
-        component_sizes[comp_id]++;
-    }
-
-    std::cout << "ComponentID,Size\n";
-    for (std::unordered_map<NodeIndex, size_t>::const_iterator it = component_sizes.begin();
-         it != component_sizes.end(); ++it) {
-        std::cout << it->first << "," << it->second << "\n";
-    }
-
-    exit(0);
+    std::cout << "Nodes,Ratio,Edges,Comps,Threads,Algorithm,Time,Speedup,SerialSpeedup,Status\n";
 
     for (NodeIndex n_count : NODE_COUNTS) {
         for (double ratio : EDGE_RATIOS) {
             long long e_count = static_cast<long long>(n_count * ratio);
 
             // 1. Create Graph (Reuse for all algos in this batch)
-            // Use max threads for faster graph generation
             Graph *graph = create_graph(n_count, e_count);
 
             // 2. Run Serial Baseline
@@ -716,44 +953,49 @@ int main() {
             // Get baseline groups for verification (requires one more run to capture output)
             std::vector<NodeIndex> baseline_groups = graph->get_connected_components_serial().group;
 
-            // 3. Run with 1 thread as baseline for speedup calculation
-            AlgoFunc parallel3_1thread = [&]() {
-                return graph->get_connected_components_parallel_3(1, false);
-            };
-            TestResult baseline_res =
-                run_benchmark("Parallel3_1thread", parallel3_1thread, RUNS, &baseline_groups);
-
-            // Output Serial Row (shown for completeness, but speedup relative to 1-thread parallel)
-            double serial_speedup = baseline_res.avg_time / serial_res.avg_time;
+            // Output Serial Row (speedup always 1.0 for itself, serial_speedup also 1.0)
             std::cout << n_count << "," << ratio << "," << e_count << ","
                       << serial_res.component_count << ",1,Serial," << std::fixed
                       << std::setprecision(5) << serial_res.avg_time << "," << std::setprecision(2)
-                      << serial_speedup << "," << (serial_res.correct ? "OK" : "FAIL") << "\n";
+                      << 1.0 << "," << 1.0 << "," << (serial_res.correct ? "OK" : "FAIL") << "\n";
 
-            // 4. Run Parallel Algorithms with Variable Threads (including 1 thread)
-            for (int t_count : THREAD_COUNTS) {
-                struct AlgoDef {
-                    std::string name;
-                    AlgoFunc func;
-                };
+            // 3. Define all parallel algorithms
+            struct AlgoDef {
+                std::string name;
+                std::function<ConnectedComponents(int)> func;
+            };
 
-                std::vector<AlgoDef> par_algos = {
-                    {"Parallel2",
-                     [&]() { return graph->get_connected_components_parallel_2(t_count); }},
-                    {"Parallel3",
-                     [&]() { return graph->get_connected_components_parallel_3(t_count, false); }}};
+            std::vector<AlgoDef> par_algos = {
+                {"Paper1",
+                 [&](int t) { return graph->get_connected_components_Shiloach_Vishkin(t); }},
+                {"Parallel3",
+                 [&](int t) { return graph->get_connected_components_parallel_3(t, false); }},
+                {"SV_improvement",
+                 [&](int t) { return graph->get_connected_components_SV_impr(t); }}};
 
-                for (const auto &alg : par_algos) {
+            // 4. For each algorithm, compute its own baseline with 1 thread
+            for (const auto &alg : par_algos) {
+                // Compute baseline for this algorithm with 1 thread
+                AlgoFunc baseline_func = [&]() { return alg.func(1); };
+                TestResult baseline_res = run_benchmark((alg.name + "_1thread").c_str(),
+                                                        baseline_func, RUNS, &baseline_groups);
+
+                // Run and report for all thread counts
+                for (int t_count : THREAD_COUNTS) {
+                    AlgoFunc algo_func = [&]() { return alg.func(t_count); };
                     TestResult res =
-                        run_benchmark(alg.name.c_str(), alg.func, RUNS, &baseline_groups);
+                        run_benchmark(alg.name.c_str(), algo_func, RUNS, &baseline_groups);
 
-                    // Speedup relative to 1-thread baseline
+                    // Speedup relative to this algorithm's own 1-thread baseline
                     double speedup = baseline_res.avg_time / res.avg_time;
+
+                    // Speedup relative to serial baseline
+                    double serial_speedup = serial_res.avg_time / res.avg_time;
 
                     std::cout << n_count << "," << ratio << "," << e_count << ","
                               << serial_res.component_count << "," << t_count << "," << alg.name
                               << "," << std::fixed << std::setprecision(5) << res.avg_time << ","
-                              << std::setprecision(2) << speedup << ","
+                              << std::setprecision(2) << speedup << "," << serial_speedup << ","
                               << (res.correct ? "OK" : "FAIL") << "\n";
                 }
             }
