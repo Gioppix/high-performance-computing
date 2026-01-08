@@ -7,7 +7,11 @@ SSH_HOST="giovanni.feltrin@hpc2.unitn.it" # run `ssh-copy-id giovanni.feltrin@hp
 LOCAL_DIR="./current"
 REMOTE_DIR="~/hpc_jobs"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-REMOTE_JOB_DIR="${REMOTE_DIR}/job_${TIMESTAMP}"
+NAME_SUFFIX=""
+if [ -n "$1" ]; then
+    NAME_SUFFIX="_$1"
+fi
+REMOTE_JOB_DIR="${REMOTE_DIR}/job_${TIMESTAMP}${NAME_SUFFIX}"
 
 echo "========================================="
 echo "HPC Job Deployment Script"
@@ -54,33 +58,10 @@ echo "  View errors:   ssh ${SSH_HOST} 'cat ${REMOTE_JOB_DIR}/run_mpi.sh.e*'"
 echo "  Cancel job:    ssh ${SSH_HOST} 'qdel ${JOB_ID}'"
 echo "  List files:    ssh ${SSH_HOST} 'ls -lh ${REMOTE_JOB_DIR}'"
 echo "  SSH to dir:    ssh ${SSH_HOST} -t 'cd ${REMOTE_JOB_DIR} && bash'"
+echo ""
+echo "  Monitor job:   ./slow_poll.sh ${SSH_HOST} ${REMOTE_JOB_DIR}"
 echo "========================================="
 
 echo ""
-echo "Waiting for job to complete..."
-
-# Wait for job to complete
-while true; do
-    JOB_STATUS=$(ssh ${SSH_HOST} "qstat ${JOB_ID} 2>/dev/null | tail -n 1 | awk '{print \$5}'")
-
-    if [ -z "$JOB_STATUS" ]; then
-        echo "Job completed!"
-        break
-    fi
-
-    echo "Job status: ${JOB_STATUS} - waiting..."
-    sleep 2
-done
-
-# Display results
-echo ""
-echo "========================================="
-echo "Job Errors (if any):"
-echo "========================================="
-ssh ${SSH_HOST} "cat ${REMOTE_JOB_DIR}/run_mpi.sh.e* 2>/dev/null"
-
-echo ""
-echo "========================================="
-echo "Job Output:"
-echo "========================================="
-ssh ${SSH_HOST} "cat ${REMOTE_JOB_DIR}/run_mpi.sh.o* 2>/dev/null"
+echo "Starting job monitor..."
+./slow_poll.sh ${SSH_HOST} ${REMOTE_JOB_DIR}
